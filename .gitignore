@@ -1,0 +1,35 @@
+# Local AI / LLMwiki / editor-agent files (not project runtime)
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/CODEX.md
+/CURSOR.md
+/copilot-instructions.md
+/.cursorrules
+/.cursor/
+/.codex/
+/.claude/
+/.agents/
+/.agent/
+/.windsurf/
+/.cline/
+/.roo/
+/.aider/
+/.continue/
+/.kiro/
+/.amazonq/
+/.junie/
+/.openhands/
+/.github/copilot-instructions.md
+/dot_github/copilot-instructions.md
+
+# Local specifications and inspection evidence
+/SPEC.md
+/DESIGN.md
+/docs/local/
+.DS_Store
+
+# Swift / app artifacts
+.build/
+dist/
+*.xcuserstate
