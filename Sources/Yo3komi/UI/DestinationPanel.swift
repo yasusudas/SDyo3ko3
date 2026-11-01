@@ -1,16 +1,16 @@
 import SwiftUI
 import AppKit
 
-/// Year → MM-DD tree built from the model's `folderSummaries` (planned items only, never existing counts).
+/// Year → MM-DD tree including existing folders; counts describe planned additions only.
 struct DateTreeYear: Identifiable {
     var id: String { year }
     var year: String
     var days: [FolderSummary]
     var count: Int { days.reduce(0) { $0 + $1.count } }
+    var hasSelectableItems = false
 
-    static func build(_ summaries: [FolderSummary], plannedOnly: Bool) -> [DateTreeYear] {
-        let rows = plannedOnly ? summaries.filter { $0.count > 0 } : summaries
-        let grouped = Dictionary(grouping: rows) { UIFormat.splitFolder($0.path).year }
+    static func build(_ summaries: [FolderSummary], selectableDates: Set<String> = []) -> [DateTreeYear] {
+        let grouped = Dictionary(grouping: summaries) { UIFormat.splitFolder($0.path).year }
         let years = grouped.keys.sorted { a, b in
             // Chronological; anything unparseable (e.g. 日時不明) goes last.
             switch (Int(a), Int(b)) {
@@ -21,7 +21,8 @@ struct DateTreeYear: Identifiable {
             }
         }
         return years.map { year in
-            DateTreeYear(year: year, days: grouped[year, default: []].sorted { lhs, rhs in lhs.path < rhs.path })
+            let days = grouped[year, default: []].sorted { lhs, rhs in lhs.path < rhs.path }
+            return DateTreeYear(year: year, days: days, hasSelectableItems: days.contains { selectableDates.contains($0.path) })
         }
     }
 }
@@ -29,8 +30,7 @@ struct DateTreeYear: Identifiable {
 struct DestinationPanel: View {
     @ObservedObject var model: AppModel
     var onRequestDateResolution: (MediaItem) -> Void
-    @AppStorage("ui.dateTree.plannedOnly") private var plannedOnly = true
-    @State private var collapsedYears: Set<String> = []
+    @State private var yearExpansionOverrides: [String: Bool] = [:]
 
     private var destinationName: String {
         UIFormat.volumeName(of: model.destinationURL) ?? model.destinationURL?.lastPathComponent ?? "未設定"
@@ -38,7 +38,9 @@ struct DestinationPanel: View {
 
     var body: some View {
         let summaries = model.folderSummaries
-        let years = DateTreeYear.build(summaries, plannedOnly: plannedOnly)
+        let selections = model.dateSelections
+        let years = DateTreeYear.build(summaries, selectableDates: Set(selections.keys))
+        let availableYears = years.filter { $0.hasSelectableItems || $0.count > 0 }.map(\.year)
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -46,14 +48,8 @@ struct DestinationPanel: View {
                     destinationCard
                     PanelHeader("容量")
                     capacitySection
-                    PanelHeader("日付フォルダ") {
-                        Toggle("予定のみ", isOn: $plannedOnly)
-                            .toggleStyle(.checkbox)
-                            .controlSize(.small)
-                            .font(.system(size: 10))
-                            .help("オフにすると、追加予定がない既存の日付フォルダも表示します")
-                    }
-                    dateTree(years)
+                    PanelHeader("日付フォルダ")
+                    dateTree(years, selections: selections)
                     PanelHeader("今回の予定")
                     planSummary(summaries)
                 }
@@ -66,6 +62,13 @@ struct DestinationPanel: View {
         .panelBackground()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("保存先")
+        .onChange(of: availableYears) { _, _ in
+            // Selection changes must not collapse the year containing the checkbox.
+            yearExpansionOverrides.removeAll()
+        }
+        .onChange(of: model.destinationURL) { _, _ in
+            yearExpansionOverrides.removeAll()
+        }
     }
 
     // MARK: Destination
@@ -148,7 +151,7 @@ struct DestinationPanel: View {
 
     // MARK: Date tree
 
-    @ViewBuilder private func dateTree(_ years: [DateTreeYear]) -> some View {
+    @ViewBuilder private func dateTree(_ years: [DateTreeYear], selections: [String: DateSelectionSummary]) -> some View {
         if years.isEmpty {
             Text(emptyTreeMessage)
                 .font(.system(size: 11))
@@ -160,8 +163,8 @@ struct DestinationPanel: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(years) { year in
                     yearRow(year)
-                    if !collapsedYears.contains(year.year) {
-                        ForEach(year.days) { day in dayRow(day, groupedUnder: year.year) }
+                    if isExpanded(year) {
+                        ForEach(year.days) { day in dayRow(day, selection: selections[day.path]) }
                     }
                 }
             }
@@ -171,13 +174,17 @@ struct DestinationPanel: View {
     private var emptyTreeMessage: String {
         if model.isScanning { return "照合が終わると、日付ごとの追加予定件数を表示します。" }
         if model.items.isEmpty { return "取り込み対象はまだありません。" }
-        return plannedOnly ? "選択中の項目はありません。" : "日付フォルダはありません。"
+        return "日付フォルダはありません。"
+    }
+
+    private func isExpanded(_ year: DateTreeYear) -> Bool {
+        yearExpansionOverrides[year.year] ?? (year.hasSelectableItems || year.count > 0)
     }
 
     private func yearRow(_ year: DateTreeYear) -> some View {
-        let collapsed = collapsedYears.contains(year.year)
+        let collapsed = !isExpanded(year)
         return Button {
-            if collapsed { collapsedYears.remove(year.year) } else { collapsedYears.insert(year.year) }
+            yearExpansionOverrides[year.year] = collapsed
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "chevron.right")
@@ -196,69 +203,83 @@ struct DestinationPanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(year.year)年、追加予定\(year.count)件")
+        .accessibilityLabel(year.count > 0 ? "\(year.year)年、追加予定\(year.count)件" : "\(year.year)年")
         .accessibilityValue(collapsed ? "折りたたみ" : "展開")
         .accessibilityHint("日付の一覧を開閉します")
     }
 
-    private func dayRow(_ day: FolderSummary, groupedUnder year: String) -> some View {
+    private func dayRow(_ day: FolderSummary, selection: DateSelectionSummary?) -> some View {
         let parts = UIFormat.splitFolder(day.path)
         let isDateFolder = parts.year != parts.day
         let isActive = model.dateFilter == day.path
-        return Button {
-            if !isDateFolder {
-                model.dateFilter = nil
-                model.filter = .attention
+        return HStack(spacing: 6) {
+            if let selection, selection.total > 0 {
+                DateSelectionCheckbox(
+                    state: selection.isAllSelected ? .on : (selection.isPartiallySelected ? .mixed : .off),
+                    enabled: !model.isBusy,
+                    title: "\(day.path)をまとめて選択",
+                    action: { model.selectDate(day.path, selected: !selection.isAllSelected) }
+                )
+                .frame(width: 16, height: 16)
             } else {
-                model.dateFilter = isActive ? nil : day.path
-            }
-        } label: {
-            HStack(spacing: 6) {
                 Image(systemName: day.isNew && day.count > 0 ? "folder.badge.plus" : "folder")
                     .font(.system(size: 11))
-                    .foregroundStyle(day.isNew && day.count > 0 ? Color.ykSecondary : Color.ykTertiary)
+                    .foregroundStyle(Color.ykTertiary)
                     .frame(width: 16)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(isDateFolder ? parts.day : day.path)
-                            .font(.system(size: 12).monospacedDigit())
-                            .foregroundStyle(Color.ykPrimary)
-                        if day.isNew && day.count > 0 {
-                            Text("新規")
+            }
+            Button {
+                if !isDateFolder {
+                    model.dateFilter = nil
+                    model.filter = .attention
+                } else {
+                    model.dateFilter = isActive ? nil : day.path
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(isDateFolder ? parts.day : day.path)
+                                .font(.system(size: 12).monospacedDigit())
+                                .foregroundStyle(Color.ykPrimary)
+                            if day.isNew && day.count > 0 {
+                                Text("新規")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.ykSecondary)
+                            }
+                        }
+                        if day.count > 0 {
+                            Text(breakdown(day))
                                 .font(.system(size: 10))
-                                .foregroundStyle(Color.ykSecondary)
+                                .foregroundStyle(Color.ykTertiary)
+                                .lineLimit(1)
                         }
                     }
-                    if day.count > 0 {
-                        Text(breakdown(day))
-                            .font(.system(size: 10))
-                            .foregroundStyle(Color.ykTertiary)
-                            .lineLimit(1)
-                    }
+                    Spacer(minLength: 4)
+                    plannedCount(day.count)
                 }
-                Spacer(minLength: 4)
-                plannedCount(day.count)
+                .contentShape(Rectangle())
             }
-            .padding(.leading, 30)
-            .padding(.trailing, 14)
-            .padding(.vertical, 4)
-            .background(isActive ? Color.ykRowSelection : Color.clear)
-            .overlay(alignment: .leading) {
-                if isActive { Rectangle().fill(Color.accentColor).frame(width: 2) }
-            }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .help(isActive ? "絞り込みを解除" : "\(day.path)で絞り込み")
+            .accessibilityLabel(accessibilityText(day, isDateFolder: isDateFolder))
+            .accessibilityValue(isActive ? "絞り込み中" : "")
+            .accessibilityAddTraits(isActive ? .isSelected : [])
         }
-        .buttonStyle(.plain)
-        .help(isActive ? "絞り込みを解除" : "\(day.path) に保存予定の項目だけを表示（選択は変わりません）")
-        .accessibilityLabel(accessibilityText(day, isDateFolder: isDateFolder))
-        .accessibilityValue(isActive ? "絞り込み中" : "")
-        .accessibilityAddTraits(isActive ? .isSelected : [])
+        .padding(.leading, 30)
+        .padding(.trailing, 14)
+        .padding(.vertical, 4)
+        .background(isActive ? Color.ykRowSelection : Color.clear)
+        .overlay(alignment: .leading) {
+            if isActive { Rectangle().fill(Color.accentColor).frame(width: 2) }
+        }
     }
 
-    private func plannedCount(_ count: Int) -> some View {
-        Text("+\(count.formatted())件")
-            .font(.system(size: 11, weight: count > 0 ? .medium : .regular).monospacedDigit())
-            .foregroundStyle(count > 0 ? Color.ykPrimary : Color.ykTertiary)
+    @ViewBuilder private func plannedCount(_ count: Int) -> some View {
+        if count > 0 {
+            Text("+\(count.formatted())件")
+                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                .foregroundStyle(Color.ykPrimary)
+        }
     }
 
     private func breakdown(_ day: FolderSummary) -> String {
@@ -272,8 +293,7 @@ struct DestinationPanel: View {
     private func accessibilityText(_ day: FolderSummary, isDateFolder: Bool) -> String {
         var text = isDateFolder ? "\(day.path.replacingOccurrences(of: "/", with: "年 ").replacingOccurrences(of: "-", with: "月"))日" : day.path
         if day.isNew && day.count > 0 { text += "、新規フォルダ" }
-        text += "、追加予定\(day.count)件"
-        if day.count > 0 { text += "、写真\(day.photos)件、動画\(day.videos)件、\(formattedBytes(day.bytes))" }
+        if day.count > 0 { text += "、追加予定\(day.count)件、写真\(day.photos)件、動画\(day.videos)件、\(formattedBytes(day.bytes))" }
         return text
     }
 
@@ -300,5 +320,33 @@ struct DestinationPanel: View {
             }
         }
         .padding(.horizontal, 14)
+    }
+}
+
+/// Use the system checkbox so partial selection has the native mixed state.
+private struct DateSelectionCheckbox: NSViewRepresentable {
+    var state: NSControl.StateValue
+    var enabled: Bool
+    var title: String
+    var action: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(checkboxWithTitle: "", target: context.coordinator, action: #selector(Coordinator.toggle))
+        button.controlSize = .small
+        button.allowsMixedState = true
+        return button
+    }
+    func updateNSView(_ button: NSButton, context: Context) {
+        context.coordinator.action = action
+        button.state = state
+        button.isEnabled = enabled
+        button.setAccessibilityLabel(title)
+        button.toolTip = state == .on ? "すべて解除" : "すべて選択"
+    }
+    final class Coordinator: NSObject {
+        var action: () -> Void
+        init(action: @escaping () -> Void) { self.action = action }
+        @objc func toggle() { action() }
     }
 }

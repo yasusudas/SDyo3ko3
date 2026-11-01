@@ -21,6 +21,7 @@ final class HashIndex {
                   sqlite3_exec(db,sql,nil,nil,nil)==SQLITE_OK else {throw ImportError.message("索引を再構築できません。")}
             sqlite3_busy_timeout(db,3000)
         }
+        _ = sqlite3_exec(db,"CREATE TABLE IF NOT EXISTS video_hashes(key TEXT PRIMARY KEY,stamp TEXT NOT NULL,record BLOB NOT NULL)",nil,nil,nil)
     }
     deinit { sqlite3_close(db) }
     func lookup(_ key: String, stamp: FileStamp) -> (String?, String?)? {
@@ -40,4 +41,22 @@ final class HashIndex {
         sqlite3_step(q)
     }
     private func signature(_ s: FileStamp) -> String { "v1|\(s.size)|\(s.modified)|\(s.changed)|\(s.fileID)" }
+
+    func video(_ key: String, stamp: FileStamp) -> VideoFingerprint? {
+        var q: OpaquePointer?; defer { sqlite3_finalize(q) }
+        guard sqlite3_prepare_v2(db,"SELECT record FROM video_hashes WHERE key=? AND stamp=?",-1,&q,nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(q,1,key,-1,transient); sqlite3_bind_text(q,2,signature(stamp),-1,transient)
+        guard sqlite3_step(q) == SQLITE_ROW, let bytes=sqlite3_column_blob(q,0),
+              let value=try? JSONDecoder().decode(VideoFingerprint.self,from:Data(bytes:bytes,count:Int(sqlite3_column_bytes(q,0)))),
+              (try? value.validate()) != nil else { return nil }
+        return value
+    }
+    func saveVideo(_ key: String, stamp: FileStamp, value: VideoFingerprint) {
+        guard let data=try? JSONEncoder().encode(value) else { return }
+        var q: OpaquePointer?; defer { sqlite3_finalize(q) }
+        guard sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO video_hashes(key,stamp,record) VALUES(?,?,?)",-1,&q,nil) == SQLITE_OK else { return }
+        sqlite3_bind_text(q,1,key,-1,transient);sqlite3_bind_text(q,2,signature(stamp),-1,transient)
+        _ = data.withUnsafeBytes { sqlite3_bind_blob(q,3,$0.baseAddress,Int32(data.count),transient) }
+        sqlite3_step(q)
+    }
 }

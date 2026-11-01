@@ -75,6 +75,13 @@ struct MainWindowView: View {
         VStack(spacing: 0) {
             FilterBar(model: model)
             Rectangle().fill(Color.ykSeparator).frame(height: 1)
+            // Result of history export/import, which can be started from the ⋯ menu as well as Settings.
+            if let message = model.historyMessage, !model.isManagingHistory {
+                NoticeBanner(.info, title: "取り込み履歴", message: message) {
+                    Button("閉じる") { model.historyMessage = nil }.buttonStyle(FlatButtonStyle())
+                }
+                Rectangle().fill(Color.ykSeparator).frame(height: 1)
+            }
             CenterNotices(model: model, onRequestDateResolution: { dateTarget = $0 })
             ZStack {
                 MediaGridView(model: model, onRequestDateResolution: { dateTarget = $0 })
@@ -111,6 +118,11 @@ struct MainWindowView: View {
                 Divider()
                 Button("保存先をFinderで開く") { model.revealDestination() }
                     .disabled(!model.isDestinationConnected)
+                Divider()
+                Button("取り込み履歴を書き出す…") { model.exportHistory() }
+                    .disabled(model.isBusy)
+                Button("取り込み履歴を読み込む…") { model.importHistory() }
+                    .disabled(model.isBusy)
             } label: {
                 Label("その他", systemImage: "ellipsis.circle")
             }

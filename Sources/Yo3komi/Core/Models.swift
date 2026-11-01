@@ -59,6 +59,7 @@ struct MediaItem: Identifiable, Codable, Sendable {
     var destinationURL: URL?
     var duplicateURL: URL?
     var digest: String?
+    var videoFingerprint: VideoFingerprint?
     var related: [RelatedFile] = []
     var supplementURLs: [URL] = []
     var supplementSelected = false
@@ -67,6 +68,12 @@ struct MediaItem: Identifiable, Codable, Sendable {
     var name: String { url.lastPathComponent }
     var byteCount: Int64 { stamp.size }
     var fileExtension: String { url.pathExtension.uppercased() }
+}
+struct DateSelectionSummary: Equatable {
+    var total = 0
+    var selected = 0
+    var isAllSelected: Bool { total > 0 && selected == total }
+    var isPartiallySelected: Bool { selected > 0 && selected < total }
 }
 struct FolderSummary: Identifiable {
     var id: String { path }

@@ -6,6 +6,104 @@ struct ScanRequest: Sendable {
     var source: URL; var destination: URL; var mode: SourceMode
     var dcim: Bool; var clip: Bool; var timeZone: String; var force: Bool
 }
+
+/// A read-only comparison of scan inputs. Never rebases the stricter import manifests or hash caches.
+struct ScanObservation: Equatable {
+    let source: URL
+    let destination: URL
+    let mode: SourceMode
+    let dcim: Bool
+    let clip: Bool
+    let timeZone: String
+    let sourceIdentity: String
+    let destinationIdentity: String
+    let sourceFiles: [String: FileStamp]
+    let destinationFiles: [String: FileStamp]
+    let folders: Set<String>
+
+    init(request: ScanRequest, sourceIdentity: String, destinationIdentity: String,
+         sourceFiles: [String: FileStamp], destinationFiles: [String: FileStamp], folders: Set<String>) {
+        source = request.source; destination = request.destination
+        mode = request.mode; dcim = request.dcim; clip = request.clip; timeZone = request.timeZone
+        self.sourceIdentity = sourceIdentity; self.destinationIdentity = destinationIdentity
+        self.sourceFiles = Self.relevantFiles(sourceFiles)
+        self.destinationFiles = Self.relevantFiles(destinationFiles)
+        self.folders = folders
+    }
+
+    func matchesRequest(_ request: ScanRequest) -> Bool {
+        source == request.source && destination == request.destination && mode == request.mode &&
+            dcim == request.dcim && clip == request.clip && timeZone == request.timeZone
+    }
+
+    static func relevantFiles(_ files: [String: FileStamp]) -> [String: FileStamp] {
+        files.filter { FileSystem.kind(URL(fileURLWithPath: $0.key)) != nil }
+    }
+
+    static func sourceRoots(_ request: ScanRequest, warnings: inout [String]) throws -> [URL] {
+        guard request.mode == .camera else { return [request.source] }
+        var roots: [URL] = []
+        for (enabled, path) in [(request.dcim, "DCIM"), (request.clip, "PRIVATE/M4ROOT/CLIP")] where enabled {
+            let url = request.source.appendingPathComponent(path, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                roots.append(url)
+            } else { warnings.append("\(path) が見つかりません。") }
+        }
+        guard !roots.isEmpty else { throw ImportError.message("探索対象のDCIM/CLIPがありません。元フォルダか探索方式を確認してください。") }
+        return roots
+    }
+
+    static func destinationFolders(_ destination: URL, files: [URL]) throws -> Set<String> {
+        var folders = Set<String>()
+        for year in try FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: .skipsHiddenFiles) {
+            try Task.checkCancellation()
+            guard year.lastPathComponent.range(of: "^[0-9]{4}$", options: .regularExpression) != nil,
+                  let values = try? year.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            for day in try FileManager.default.contentsOfDirectory(at: year, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: .skipsHiddenFiles) {
+                let values = try day.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                if values.isDirectory == true, values.isSymbolicLink != true,
+                   day.lastPathComponent.range(of: "^[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil {
+                    folders.insert(year.lastPathComponent + "/" + day.lastPathComponent)
+                }
+            }
+        }
+        for url in files {
+            try Task.checkCancellation()
+            let components = url.deletingLastPathComponent().path.replacingOccurrences(of: destination.path + "/", with: "").split(separator: "/")
+            if components.count >= 2, components[0].count == 4, components[1].count == 5 {
+                folders.insert("\(components[0])/\(components[1])")
+            }
+        }
+        return folders
+    }
+
+    static func capture(_ request: ScanRequest) throws -> ScanObservation {
+        try FileSystem.validateRoots(request.source, request.destination)
+        let sourceIdentity = try FileSystem.identity(request.source)
+        let destinationIdentity = try FileSystem.identity(request.destination)
+        let destinationURLs = try FileSystem.enumerate(request.destination)
+        var warnings: [String] = []
+        let sourceURLs = try sourceRoots(request, warnings: &warnings).flatMap { try FileSystem.enumerate($0) }
+        func stamps(_ urls: [URL]) throws -> [String: FileStamp] {
+            var result: [String: FileStamp] = [:]
+            for url in urls where FileSystem.kind(url) != nil {
+                try Task.checkCancellation()
+                result[url.path] = try FileSystem.stamp(url)
+            }
+            return result
+        }
+        let result = try ScanObservation(request: request, sourceIdentity: sourceIdentity, destinationIdentity: destinationIdentity,
+                                         sourceFiles: stamps(sourceURLs), destinationFiles: stamps(destinationURLs),
+                                         folders: destinationFolders(request.destination, files: destinationURLs))
+        guard sourceIdentity == (try FileSystem.identity(request.source)),
+              destinationIdentity == (try FileSystem.identity(request.destination)) else {
+            throw ImportError.message("確認中にストレージが変更されました。再読み込みしてください。")
+        }
+        return result
+    }
+}
 struct ScanUpdate: Sendable {
     var items: [MediaItem]? = nil
     var changed: [MediaItem] = []
@@ -30,12 +128,32 @@ actor ImportEngine {
     private var sourceIdentity = ""; private var destinationIdentity = ""
     private var samples: [String:String] = [:]; private var hashes: [String:String] = [:]
     private var lastCleanScan = false
+    private var lastObservation: ScanObservation?
+    private var videoFingerprints: [String: VideoFingerprint] = [:]
+
+    private func openedHistory() throws -> ImportHistory {
+        if history == nil { history = try ImportHistory() }
+        return history!
+    }
+    func historySummary() throws -> HistorySummary { try openedHistory().summary() }
+    func exportHistory(to url: URL) throws -> Int { try openedHistory().exportFile(to: url) }
+    func importHistory(from url: URL) throws -> HistoryMergeResult {
+        let result = try openedHistory().importFile(from: url)
+        lastCleanScan = false
+        return result
+    }
+
+    func hasRelevantChanges(_ request: ScanRequest) throws -> Bool {
+        guard lastCleanScan, let previous = lastObservation, previous.matchesRequest(request) else { return true }
+        return try ScanObservation.capture(request) != previous
+    }
 
     func scan(_ request: ScanRequest, update: @escaping @Sendable (ScanUpdate) async -> Void) async throws -> ScanResult {
         try FileSystem.validateRoots(request.source,request.destination)
         let sourceID=try FileSystem.identity(request.source), destID=try FileSystem.identity(request.destination)
         sourceIdentity=sourceID; destinationIdentity=destID; lastRequest=request; lastCleanScan=false
         samples.removeAll(); hashes.removeAll(); manifest.removeAll();sourceManifest.removeAll()
+        videoFingerprints.removeAll()
         if index == nil { index=try? HashIndex() }
         if history == nil {history=try ImportHistory()}
         var warnings: [String]=[]
@@ -43,31 +161,13 @@ actor ImportEngine {
         await update(ScanUpdate(message:"保存先のファイルを確認中…"))
         let destinationFiles=try FileSystem.enumerate(request.destination)
         var sizeMap: [Int64:[URL]]=[:]
-        var folders=Set<String>()
-        for year in try FileManager.default.contentsOfDirectory(at:request.destination,includingPropertiesForKeys:[.isDirectoryKey,.isSymbolicLinkKey],options:.skipsHiddenFiles) {
-            guard year.lastPathComponent.range(of:"^[0-9]{4}$",options:.regularExpression) != nil,let values=try? year.resourceValues(forKeys:[.isDirectoryKey,.isSymbolicLinkKey]),values.isDirectory==true,values.isSymbolicLink != true else{continue}
-            for day in try FileManager.default.contentsOfDirectory(at:year,includingPropertiesForKeys:[.isDirectoryKey,.isSymbolicLinkKey],options:.skipsHiddenFiles) {
-                let v=try day.resourceValues(forKeys:[.isDirectoryKey,.isSymbolicLinkKey])
-                if v.isDirectory==true,v.isSymbolicLink != true,day.lastPathComponent.range(of:"^[0-9]{2}-[0-9]{2}$",options:.regularExpression) != nil {folders.insert(year.lastPathComponent+"/"+day.lastPathComponent)}
-            }
-        }
+        let folders=try ScanObservation.destinationFolders(request.destination, files: destinationFiles)
         for url in destinationFiles {
             try Task.checkCancellation()
             let stamp=try FileSystem.stamp(url); manifest[url.path]=stamp
             if let kind=FileSystem.kind(url), kind != .sidecar { sizeMap[stamp.size,default:[]].append(url) }
-            let components=url.deletingLastPathComponent().path.replacingOccurrences(of:request.destination.path+"/",with:"").split(separator:"/")
-            if components.count>=2, components[0].count==4, components[1].count==5 { folders.insert("\(components[0])/\(components[1])") }
         }
-        var roots: [URL]=[]
-        if request.mode == .camera {
-            for (enabled,path) in [(request.dcim,"DCIM"),(request.clip,"PRIVATE/M4ROOT/CLIP")] where enabled {
-                let u=request.source.appendingPathComponent(path,isDirectory:true)
-                var isDir: ObjCBool=false
-                if FileManager.default.fileExists(atPath:u.path,isDirectory:&isDir),isDir.boolValue { roots.append(u) }
-                else { warnings.append("\(path) が見つかりません。") }
-            }
-            guard !roots.isEmpty else { throw ImportError.message("探索対象のDCIM/CLIPがありません。元フォルダか探索方式を確認してください。") }
-        } else { roots=[request.source] }
+        let roots=try ScanObservation.sourceRoots(request, warnings: &warnings)
         var files: [URL]=[]
         for root in roots { files += try FileSystem.enumerate(root) }
         for file in files {sourceManifest[file.path]=try FileSystem.stamp(file)}
@@ -83,15 +183,25 @@ actor ImportEngine {
         await update(ScanUpdate(items:items,total:items.count,message:"撮影日時と重複を照合中…"))
         // One-time adoption of the existing archive. Stable fingerprints reuse full hashes later.
         let archiveMedia=destinationFiles.filter{if let kind=FileSystem.kind($0){return kind != .sidecar};return false}
+        var archiveVideos: [String: URL] = [:]
         for (n,url) in archiveMedia.enumerated() {
             try Task.checkCancellation()
             guard let stamp=manifest[url.path] else{continue}
             let hash=try digest(url,stamp:stamp,rootID:destID,force:request.force)
             let path=String(url.path.dropFirst(request.destination.path.count+1))
-            try history?.record(digest:hash,size:stamp.size,name:url.lastPathComponent,source:nil,destination:url,folder:String(path.split(separator:"/").prefix(2).joined(separator:"/")),origin:"existing-archive")
+            var video: VideoFingerprint?
+            if FileSystem.kind(url) == .video {
+                do {
+                    video = try await videoFingerprint(url, stamp: stamp, rootID: destID, force: request.force)
+                    archiveVideos[video!.digest] = url
+                } catch is CancellationError { throw CancellationError() }
+                catch { warnings.append("動画の内容照合を保留（ファイル全体の一致のみ照合）: \(url.lastPathComponent)・\(error.localizedDescription)") }
+            }
+            try history?.record(digest:hash,size:stamp.size,name:url.lastPathComponent,source:nil,destination:url,folder:String(path.split(separator:"/").prefix(2).joined(separator:"/")),origin:"existing-archive",video:video)
             if n % 16 == 0 || n==archiveMedia.count-1 {await update(ScanUpdate(completed:n+1,total:archiveMedia.count,message:"保存先の取り込み履歴を確認中 \(n+1) / \(archiveMedia.count)（初回は全内容を読み取ります）"))}
         }
         var sourceBySize: [Int64:[Int]]=[:]
+        var sourceVideos = Set<String>()
         let zone=TimeZone(identifier:request.timeZone) ?? TimeZone(identifier:"Asia/Tokyo")!
         var changed: [MediaItem]=[]
         for i in items.indices {
@@ -127,12 +237,32 @@ actor ImportEngine {
                     let hash=try digest(item.url,stamp:item.stamp,rootID:sourceID,force:request.force)
                     item.digest=hash;past=try history?.lookup(hash,size:item.stamp.size)
                 }
-                if let past {
+                var videoEquivalent = false
+                if item.isVideo {
+                    let video = try await videoFingerprint(item.url, stamp: item.stamp, rootID: sourceID, force: request.force)
+                    item.videoFingerprint = video
+                    if duplicate == nil, past == nil, let record = try history?.lookupVideo(video) {
+                        past = record
+                        duplicate = archiveVideos[video.digest]
+                        videoEquivalent = true
+                    }
+                    // Preserve the original byte hash as an alias too, even if a transformed copy matched.
+                    if duplicate != nil || past != nil {
+                        let hash = try digest(item.url, stamp: item.stamp, rootID: sourceID, force: request.force)
+                        item.digest = hash
+                        let target = duplicate ?? URL(fileURLWithPath: past!.destinationPath)
+                        try history?.record(digest: hash, size: item.stamp.size, name: item.name, source: item.url,
+                                            destination: target, folder: item.dateFolder, origin: videoEquivalent ? "video-equivalent" : "existing-archive", video: video)
+                    }
+                }
+                if let past, duplicate == nil {
                     item.status = .imported;item.isSelected=false
-                    item.message="取り込み履歴あり（SHA-256一致）。保存先から削除・移動されていても再取り込みしません。記録名: \(past.originalName)"
+                    item.message=(videoEquivalent ? "取り込み履歴あり（映像・音声のSHA-256一致）。" : "取り込み履歴あり（SHA-256一致）。")+"保存先から削除・移動されていても再取り込みしません。記録名: \(past.originalName)"
                 } else if let duplicate {
                     item.status = .imported; item.duplicateURL=duplicate; item.destinationURL=duplicate
-                    for r in item.related.indices {
+                    if videoEquivalent { item.message = "映像・音声のSHA-256一致。コンテナやメタデータが異なっていても取り込み済みです。" }
+                    // A transformed video must not receive a camera XML describing the original container.
+                    for r in item.related.indices where !videoEquivalent {
                         item.related[r].targetName=relatedName(item.related[r],for:item,final:duplicate)
                         let related=item.related[r]
                         if duplicate.lastPathComponent != item.name, xmlReferencesOriginalName(item),related.url.pathExtension.lowercased()=="xml" {item.message="XML内のファイル参照が異なるため補完を保留します。";continue}
@@ -141,7 +271,8 @@ actor ImportEngine {
                         else if let s=try? FileSystem.stamp(target),s.size != related.stamp.size { item.message="既存の付随ファイルは異なるため補完を保留します。" }
                     }
                 } else {
-                    var identicalSource=false
+                    var identicalSource = item.videoFingerprint.map { sourceVideos.contains($0.digest) } ?? false
+                    if identicalSource { item.message = "映像・音声が同一の動画がカード内にあります。" }
                     for previous in sourceBySize[item.stamp.size] ?? [] {
                         let p=items[previous]
                         if try sample(item.url,stamp:item.stamp,rootID:sourceID,force:request.force) != sample(p.url,stamp:p.stamp,rootID:sourceID,force:request.force) { continue }
@@ -153,6 +284,7 @@ actor ImportEngine {
                     else if item.dateFolder == nil { item.status = .needsDate; item.message=metadata.evidence }
                     else { item.status = .new; item.isSelected=true }
                 }
+                if let video = item.videoFingerprint { sourceVideos.insert(video.digest) }
                 sourceBySize[item.stamp.size,default:[]].append(i)
             } catch is CancellationError { throw CancellationError() }
             catch { item.status = .failed; item.message=error.localizedDescription; item.isSelected=false }
@@ -163,8 +295,24 @@ actor ImportEngine {
         }
         guard sourceID == (try FileSystem.identity(request.source)), destID == (try FileSystem.identity(request.destination)) else { throw ImportError.message("走査中にストレージが変更されました。再読み込みしてください。") }
         assignDestinations(&items,root:request.destination)
+        lastObservation=ScanObservation(request:request,sourceIdentity:sourceID,destinationIdentity:destID,
+                                        sourceFiles:sourceManifest,destinationFiles:manifest,folders:folders)
         lastCleanScan=true
         return ScanResult(items:items,warnings:warnings,existingFolders:folders.sorted(),sourceIdentity:sourceID,destinationIdentity:destID)
+    }
+    private func videoFingerprint(_ url: URL, stamp: FileStamp, rootID: String, force: Bool) async throws -> VideoFingerprint {
+        guard try FileSystem.stamp(url) == stamp else { throw ImportError.message("照合中に動画が変更されました。") }
+        if let cached = videoFingerprints[url.path] { return cached }
+        let key = rootID + "|" + url.path
+        if !force, rootID != sourceIdentity, !rootID.hasPrefix("session:"), let cached = index?.video(key, stamp: stamp) {
+            videoFingerprints[url.path] = cached
+            return cached
+        }
+        let result = try await VideoFingerprintReader.read(url)
+        guard try FileSystem.stamp(url) == stamp else { throw ImportError.message("照合中に動画が変更されました。") }
+        videoFingerprints[url.path] = result
+        index?.saveVideo(key, stamp: stamp, value: result)
+        return result
     }
     private func sample(_ url: URL,stamp: FileStamp,rootID: String,force: Bool) throws -> String {
         guard try FileSystem.stamp(url)==stamp else{throw ImportError.message("照合中にファイルが変更されました。再読み込みしてください。") }
@@ -318,7 +466,10 @@ actor ImportEngine {
         job.ownedTemporaryPaths.removeAll{$0==temp.path}; try saveJob(job)
         let finalStamp=try FileSystem.stamp(target)
         if let kind=FileSystem.kind(source),kind != .sidecar {
-            try history?.record(digest:digest,size:finalStamp.size,name:source.lastPathComponent,source:source,destination:target,folder:String(target.deletingLastPathComponent().path.dropFirst(job.destinationRoot.path.count+1)),origin:"verified-import")
+            let video = kind == .video ? videoFingerprints[source.path] : nil
+            // This hash describes the copied bytes: copying and full readback were verified above.
+            try history?.record(digest:digest,size:finalStamp.size,name:source.lastPathComponent,source:source,destination:target,folder:String(target.deletingLastPathComponent().path.dropFirst(job.destinationRoot.path.count+1)),origin:"verified-import",video:video)
+            if let video { index?.saveVideo(destinationIdentity+"|"+target.path, stamp:finalStamp, value:video) }
         }
         index?.save(destinationIdentity+"|"+target.path,stamp:finalStamp,sample:nil,digest:digest)
         return target

@@ -113,18 +113,24 @@ struct FooterBar: View {
     }
 
     private var thumbnailSlider: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "photo").font(.system(size: 9)).foregroundStyle(Color.ykTertiary)
-            Slider(value: $model.thumbnailSize, in: 120...360, onEditingChanged: { editing in
-                if !editing { model.settingsChanged() }
-            })
-            .controlSize(.small)
-            .frame(width: 110)
-            Image(systemName: "photo").font(.system(size: 14)).foregroundStyle(Color.ykTertiary)
+        VStack(alignment: .leading, spacing: 2) {
+            Text("サムネイルサイズ: \(Int(model.thumbnailSize))×\(Int(model.thumbnailSize * 2 / 3))")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundStyle(Color.ykSecondary)
+                .fixedSize(horizontal: true, vertical: false)
+            HStack(spacing: 6) {
+                Image(systemName: "photo").font(.system(size: 9)).foregroundStyle(Color.ykTertiary)
+                Slider(value: $model.thumbnailSize, in: 120...360, onEditingChanged: { editing in
+                    if !editing { model.settingsChanged() }
+                })
+                .controlSize(.small)
+                .frame(width: 110)
+                Image(systemName: "photo").font(.system(size: 14)).foregroundStyle(Color.ykTertiary)
+            }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("サムネイルの大きさ")
-        .accessibilityValue("\(Int(model.thumbnailSize))ポイント")
+        .accessibilityLabel("サムネイルサイズ")
+        .accessibilityValue("幅\(Int(model.thumbnailSize))、高さ\(Int(model.thumbnailSize * 2 / 3))ポイント")
         .accessibilityAdjustableAction { direction in
             switch direction {
             case .increment: model.thumbnailSize = min(360, model.thumbnailSize + 20)
@@ -156,22 +162,14 @@ struct FooterBar: View {
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(Color.ykSecondary)
                 }
-                Text("検出 \(UIFormat.count(model.items.count))")
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(Color.ykSecondary)
             }
         }
         .accessibilityElement(children: .combine)
         Spacer(minLength: 8)
-        Text("照合が終わるまで取り込みは開始できません")
-            .font(.system(size: 11))
-            .foregroundStyle(Color.ykTertiary)
-            .lineLimit(1)
-            .layoutPriority(-1)
-        Button("走査を停止") { model.stop() }
+        Button("スキャンを停止") { model.stop() }
             .buttonStyle(FlatButtonStyle())
             .keyboardShortcut(".", modifiers: .command)
-            .help("走査を停止します（⌘.）。再読み込みで再開できます")
+            .help("スキャンを停止します（⌘.）。再読み込みで再開できます")
     }
 
     // MARK: Importing

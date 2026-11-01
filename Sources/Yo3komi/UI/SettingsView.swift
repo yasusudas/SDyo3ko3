@@ -15,6 +15,8 @@ struct SettingsView: View {
                 .tabItem { Label("表示", systemImage: "paintbrush") }
             MaintenanceSettingsTab(model: model)
                 .tabItem { Label("照合と復旧", systemImage: "checkmark.shield") }
+            HistorySettingsTab(model: model)
+                .tabItem { Label("履歴", systemImage: "clock.arrow.circlepath") }
         }
         .frame(width: 560)
         .scenePadding()
@@ -83,7 +85,7 @@ private struct ImportSettingsTab: View {
             }
             Section("保存先") {
                 LocationRow(title: "場所", url: model.destinationURL, state: model.destinationConnectionState, disabled: model.isImporting) { model.chooseDestination() }
-                SettingsNote(text: "保存先の配下全体を、ファイル内容（SHA-256）で取り込み済みか照合します。新しいファイルは 年/月-日/元のファイル名 に保存します。")
+                SettingsNote(text: "保存先の配下全体と取り込み履歴を、ファイル内容（SHA-256）で照合します。動画は音声・映像データのハッシュでも照合します。履歴は保持されるため、保存先から削除・移動したファイルも再取り込みしません。新しいファイルは 年/月-日/元のファイル名 に保存します。")
             }
             if model.isImporting {
                 SettingsNote(text: "取り込み中は取り込み元・保存先・探索設定を変更できません。")
@@ -199,7 +201,7 @@ private struct MaintenanceSettingsTab: View {
                     Button("フルハッシュで再照合") { model.refresh(force: true) }
                         .disabled(model.isBusy)
                 }
-                SettingsNote(text: "通常はファイル属性で変更を検出して索引を再利用します。サイズや日時を保ったまま外部で書き換えられた可能性がある場合は、キャッシュを使わず全内容を読み直します。時間がかかります。")
+                SettingsNote(text: "通常はファイル属性で変更を検出して索引を再利用します。サイズや日時を保ったまま外部で書き換えられた可能性がある場合は、キャッシュを使わず全内容を読み直します。時間がかかります。取り込み履歴は消去しません。")
             }
             Section("中断した取り込み") {
                 LabeledContent("未完了のジョブ") {
@@ -218,5 +220,54 @@ private struct MaintenanceSettingsTab: View {
             Button("片付ける", role: .destructive) { model.clearRecovery() }
             Button("キャンセル", role: .cancel) {}
         }
+    }
+}
+
+/// Counts, export and import of the persistent import history. File panels, validation and the
+/// merge itself belong to the model; this tab only reports counts and the last result.
+private struct HistorySettingsTab: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section("取り込み履歴") {
+                LabeledContent("記録したファイル") {
+                    Text("\(model.historyRecordCount.formatted())件")
+                        .monospacedDigit()
+                }
+                LabeledContent("音声・映像ハッシュのある動画") {
+                    Text("\(model.videoHistoryCount.formatted())件")
+                        .monospacedDigit()
+                }
+                SettingsNote(text: "音声・映像ハッシュのない以前の記録も、ファイル全体の SHA-256 でそのまま照合に使います。")
+            }
+            Section("書き出しと読み込み") {
+                LabeledContent("履歴ファイル") {
+                    HStack {
+                        Button("書き出す…") { model.exportHistory() }
+                        Button("読み込む…") { model.importHistory() }
+                    }
+                    .disabled(model.isBusy)
+                }
+                if model.isManagingHistory {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("履歴を処理しています…")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                } else if let message = model.historyMessage {
+                    Text(message)
+                        .font(.system(size: 12))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                SettingsNote(text: "JSON 形式です。ファイル名、取り込み元と保存先のパス、ファイル全体の SHA-256、動画の音声・映像ハッシュを含みます。写真・動画そのものや編集データは含みません。")
+                SettingsNote(text: "読み込んだ履歴は現在の履歴に足し合わせます。同じ内容の記録は1件にまとめ、既存の記録は消しません。保存先の写真・動画は変更せず、読み込み後に一覧を再照合します。")
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { model.refreshHistorySummary() }
     }
 }

@@ -32,7 +32,11 @@ private struct AppRoot:View {
 }
 final class AppDelegate:NSObject,NSApplicationDelegate {
     var reopen:(()->Void)?
-    func applicationDidFinishLaunching(_ notification:Notification){NSApp.setActivationPolicy(.regular)}
+    func applicationDidFinishLaunching(_ notification:Notification){
+        NSApp.setActivationPolicy(.regular)
+        MenuLocalizer.shared.start()
+    }
+    func applicationDidBecomeActive(_ notification:Notification){MenuLocalizer.shared.localizeMainMenu()}
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool{
         if !hasVisibleWindows || !sender.windows.contains(where:{$0.isVisible && $0.title=="yo3komi"}) {reopen?();sender.activate(ignoringOtherApps:true)};return true

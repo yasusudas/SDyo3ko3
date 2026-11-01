@@ -38,20 +38,13 @@ struct ItemInspector: View {
 
             if expanded {
                 Group {
-                    if let item { content(item) } else { placeholder }
+                    if let item { content(item) }
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 12)
             }
         }
         .background(Color.ykChrome)
-    }
-
-    private var placeholder: some View {
-        Text("一覧で項目を選ぶと、撮影日時や保存予定先を表示します。")
-            .font(.system(size: 11))
-            .foregroundStyle(Color.ykTertiary)
-            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func content(_ item: MediaItem) -> some View {
